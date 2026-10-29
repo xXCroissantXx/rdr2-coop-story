@@ -136,6 +136,8 @@ public sealed class SidecarRuntime : IAsyncDisposable
     private int _peerAnimationStateObserved;
     private readonly object _peerMotionModeSync = new();
     private ILanSession? _negotiatedMotionNetwork;
+    // Companion stream for guest seats beyond the primary one; null unless the host allows more than one guest.
+    private (ILanSession Network, SecondarySeatMirror Mirror)? _seatMirror;
     private ControlPeerToken _negotiatedMotionPeer;
     private int _peerMotionModeNegotiated;
     private int _peerMotionModeAnnouncementRevision;
@@ -714,6 +716,30 @@ public sealed class SidecarRuntime : IAsyncDisposable
     // Passing that source object into callbacks lets later checks reject events from a replaced session.
     private void AttachNetwork(ILanSession network)
     {
+        _seatMirror = null;
+        if (_config.Role == SessionRole.Host &&
+            network is IMultiPeerLanSession seated &&
+            seated.MaxGuests > 1)
+        {
+            var mirror = new SecondarySeatMirror(
+                seated,
+                ToWireMotionMode(_config.MotionReplicationMode),
+                (peer, token) => ReplayAuthoritativeStateToSeatAsync(
+                    seated,
+                    peer,
+                    token),
+                _logger);
+            seated.GuestSlotChanged += (peer, connected, token) =>
+                ReferenceEquals(_network, network)
+                    ? mirror.OnSeatChangedAsync(peer, connected, token)
+                    : ValueTask.CompletedTask;
+            seated.AnyPeerEnvelopeReceived += (envelope, peer, token) =>
+                ReferenceEquals(_network, network)
+                    ? mirror.OnEnvelopeAsync(envelope, peer, token)
+                    : ValueTask.CompletedTask;
+            _seatMirror = (network, mirror);
+        }
+
         network.EnvelopeReceived += OnNetworkEnvelopeAsync;
         network.AuthenticationRejected += OnNetworkAuthenticationRejectedAsync;
         network.ConnectionChanged += (connected, cancellationToken) =>
@@ -1830,13 +1856,68 @@ public sealed class SidecarRuntime : IAsyncDisposable
             return false;
         }
 
-        return await expectedNetwork.SendControlAsync(
+        var delivered = await expectedNetwork.SendControlAsync(
                 peer,
                 type,
                 payload,
                 tick,
                 cancellationToken)
             .ConfigureAwait(false);
+        // Still under the control gate, so companion seats get host broadcasts in the same order as the primary guest.
+        if (TryGetSeatMirror(expectedNetwork) is { } mirror)
+        {
+            _ = await mirror.MirrorControlAsync(
+                    type,
+                    payload,
+                    tick,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        return delivered;
+    }
+
+    private SecondarySeatMirror? TryGetSeatMirror(ILanSession network) =>
+        _seatMirror is { } seatMirror &&
+        ReferenceEquals(seatMirror.Network, network)
+            ? seatMirror.Mirror
+            : null;
+
+    // Companion-seat version of the reconnect replay: the same coherent mission, cinematic and parent-first world frames,
+    // sent only to that seat, without touching the primary guest's entity cache, remote mapping or durable grants.
+    private async ValueTask<bool> ReplayAuthoritativeStateToSeatAsync(
+        ILanSession network,
+        ControlPeerToken peer,
+        CancellationToken cancellationToken)
+    {
+        var result = await _peerControlSendGate.RunAsync(
+                async token =>
+                {
+                    if (!ReferenceEquals(_network, network) ||
+                        !network.IsControlPeerCurrent(peer))
+                    {
+                        return default(AuthoritativePeerResyncReplayResult);
+                    }
+
+                    var plan = AuthoritativePeerResyncReplay.Create(
+                        _missionStateCache.Capture(),
+                        _missionCinematicStateCache.Capture(),
+                        _worldGraph.CaptureSpawnSnapshot(),
+                        _animSceneDefinitionCache.Capture());
+                    return await AuthoritativePeerResyncReplay.SendAsync(
+                            plan,
+                            (frame, sendToken) => network.SendControlAsync(
+                                peer,
+                                frame.Type,
+                                frame.Payload,
+                                frame.Tick,
+                                sendToken),
+                            token)
+                        .ConfigureAwait(false);
+                },
+                cancellationToken)
+            .ConfigureAwait(false);
+        return result.Completed;
     }
 
     // Send a reliable control message through the shared send gate so it keeps its order with other control work.
@@ -3209,6 +3290,15 @@ public sealed class SidecarRuntime : IAsyncDisposable
                 envelope.Payload,
                 envelope.Tick,
                 cancellationToken).ConfigureAwait(false);
+            if (TryGetSeatMirror(network) is { } playerMirror)
+            {
+                _ = await playerMirror.MirrorSnapshotAsync(
+                        envelope.Type,
+                        envelope.Payload,
+                        envelope.Tick,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
             if (delivered)
             {
                 _ = Interlocked.Increment(ref _bridgeToNetworkDelivered);
@@ -3377,6 +3467,15 @@ public sealed class SidecarRuntime : IAsyncDisposable
                 envelope.Payload,
                 envelope.Tick,
                 cancellationToken).ConfigureAwait(false);
+            if (TryGetSeatMirror(activeNetwork) is { } snapshotMirror)
+            {
+                _ = await snapshotMirror.MirrorSnapshotAsync(
+                        envelope.Type,
+                        envelope.Payload,
+                        envelope.Tick,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
             if (delivered)
             {
                 _messageFlowDiagnostics.MarkDelivered(

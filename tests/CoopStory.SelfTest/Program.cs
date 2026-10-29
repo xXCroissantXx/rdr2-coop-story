@@ -92,6 +92,8 @@ internal static class Program
         ("TCP authentication and reconnect loopback", TcpReconnectLoopbackAsync),
         ("host seats three guests, rejects a fourth and hands over primary",
             MultiGuestSeatLoopbackAsync),
+        ("companion seats negotiate, replay and receive only host broadcasts",
+            SecondarySeatMirrorLoopbackAsync),
         ("UDP binding rejects spoofing and replay", UdpBindingAndReplayAsync),
         ("UDP world bursts preserve delayed authenticated player snapshots",
             UdpWorldBurstReorderingAsync),
@@ -5345,6 +5347,214 @@ internal static class Program
             Check.True(SlotsOf(host.ConnectedPeers).SequenceEqual(new byte[] { 1, 2, 3 }));
             Check.True(host.TryCaptureControlPeer(out var stillPrimary));
             Check.Equal((byte)2, stillPrimary.Slot);
+        }
+        finally
+        {
+            foreach (var (guest, stop, run, _) in guests)
+            {
+                await stop.CancelAsync().ConfigureAwait(false);
+                await IgnoreCancellationAsync(run).ConfigureAwait(false);
+                await guest.DisposeAsync().ConfigureAwait(false);
+                stop.Dispose();
+            }
+
+            await hostStop.CancelAsync().ConfigureAwait(false);
+            await IgnoreCancellationAsync(hostTask).ConfigureAwait(false);
+            await host.DisposeAsync().ConfigureAwait(false);
+            await logger.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async Task SecondarySeatMirrorLoopbackAsync()
+    {
+        foreach (var type in new[]
+                 {
+                     MessageType.PlayerState, MessageType.EntitySpawn, MessageType.EntityUpdate,
+                     MessageType.MissionState, MessageType.AnimSceneDefinition, MessageType.Goodbye
+                 })
+        {
+            Check.True(SecondarySeatMirror.IsMirroredType(type));
+        }
+
+        // Seat-specific flows must never reach a companion seat.
+        foreach (var type in new[]
+                 {
+                     MessageType.MissionProgression, MessageType.CampaignCapability,
+                     MessageType.CampaignCapabilityAck, MessageType.InteractionResult,
+                     MessageType.RestraintState, MessageType.DamageApplied,
+                     MessageType.MissionDialogueCue, MessageType.AmbientEncounterState,
+                     MessageType.MotionReplicationConfig, MessageType.ResyncRequest
+                 })
+        {
+            Check.False(SecondarySeatMirror.IsMirroredType(type));
+        }
+
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "CoopStory.SelfTest",
+            Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var credentials = SessionCredentials.Generate();
+        var baseConfig = new SidecarConfig
+        {
+            HostAddress = "127.0.0.1",
+            TcpPort = FindFreeTcpPort(),
+            UdpPort = FindFreeUdpPort(),
+            SessionToken = credentials.ExportToken(),
+            Network = new NetworkConfig
+            {
+                HeartbeatIntervalMs = 100,
+                HeartbeatTimeoutMs = 600,
+                ReconnectMinMs = 100,
+                ReconnectMaxMs = 400,
+                MaxGuests = 3
+            },
+            ProfilePath = Path.Combine(root, "guest-profile.json"),
+            LogPath = Path.Combine(root, "network.jsonl")
+        };
+        var guestConfig = baseConfig with { Role = SessionRole.Guest };
+        var logger = new JsonLineLogger(baseConfig.LogPath);
+        var host = new LanSessionHost(
+            baseConfig with { Role = SessionRole.Host },
+            credentials,
+            logger,
+            IPAddress.Loopback);
+        var gate = new object();
+        var replays = new List<byte>();
+        var mirror = new SecondarySeatMirror(
+            host,
+            MotionReplicationWireMode.AnimGraphReplica,
+            (peer, _) =>
+            {
+                lock (gate) replays.Add(peer.Slot);
+                return ValueTask.FromResult(true);
+            },
+            logger);
+        host.GuestSlotChanged += mirror.OnSeatChangedAsync;
+        host.AnyPeerEnvelopeReceived += mirror.OnEnvelopeAsync;
+        using var hostStop = new CancellationTokenSource();
+        var hostTask = host.RunAsync(hostStop.Token);
+        var guests = new List<(LanSessionGuest Guest, CancellationTokenSource Stop, Task Run, List<ProtocolEnvelope> Inbox)>();
+
+        int StartGuest()
+        {
+            var guest = new LanSessionGuest(guestConfig, credentials, logger, IPAddress.Loopback);
+            var inbox = new List<ProtocolEnvelope>();
+            guest.EnvelopeReceived += (envelope, _, _) =>
+            {
+                if (envelope.Type != MessageType.Heartbeat && envelope.Type != MessageType.ResyncRequest)
+                {
+                    lock (gate) inbox.Add(envelope with { Payload = envelope.Payload.ToArray() });
+                }
+
+                return ValueTask.CompletedTask;
+            };
+            var stop = new CancellationTokenSource();
+            guests.Add((guest, stop, guest.RunAsync(stop.Token), inbox));
+            return guests.Count - 1;
+        }
+
+        List<ProtocolEnvelope> Inbox(int guest)
+        {
+            lock (gate) return guests[guest].Inbox.ToList();
+        }
+
+        bool Received(int guest, MessageType type, byte marker) =>
+            Inbox(guest).Any(e => e.Type == type && e.Payload.Length > 0 && e.Payload.Span[0] == marker);
+
+        byte[] Announcement(MotionReplicationWireMode mode) =>
+            AnimationReplicationPayloadCodec.EncodeMotionReplicationConfig(
+                new MotionReplicationConfigPayload(
+                    AnimationReplicationPayloadCodec.MotionReplicationConfigSchemaVersion,
+                    mode,
+                    MotionReplicationConfigFlags.None,
+                    7));
+
+        try
+        {
+            await Task.Delay(50).ConfigureAwait(false);
+            for (var i = 0; i < 3; i++)
+            {
+                var index = StartGuest();
+                await WaitUntilAsync(
+                    () => guests[index].Guest.IsConnected && host.ConnectedPeers.Count == index + 1,
+                    TimeSpan.FromSeconds(5),
+                    $"Guest {index + 1} did not take a seat.").ConfigureAwait(false);
+            }
+
+            // Companion seats get the host motion-mode announcement; the primary is left to the runtime.
+            await WaitUntilAsync(
+                () => Inbox(1).Any(static e => e.Type == MessageType.MotionReplicationConfig) &&
+                    Inbox(2).Any(static e => e.Type == MessageType.MotionReplicationConfig),
+                TimeSpan.FromSeconds(3),
+                "Companion seats were not sent the host motion mode.").ConfigureAwait(false);
+            var announced = AnimationReplicationPayloadCodec.DecodeMotionReplicationConfig(
+                Inbox(1).First(static e => e.Type == MessageType.MotionReplicationConfig).Payload.Span);
+            Check.Equal(MotionReplicationWireMode.AnimGraphReplica, announced.Mode);
+            Check.False(Inbox(0).Any(static e => e.Type == MessageType.MotionReplicationConfig));
+
+            // Nothing streams before the seat agrees, and a ResyncRequest before agreement is not replayed.
+            Check.True(await guests[1].Guest.SendControlAsync(
+                MessageType.ResyncRequest, Array.Empty<byte>(), NetworkClock.Tick).ConfigureAwait(false));
+            Check.Equal(0, await mirror.MirrorControlAsync(
+                MessageType.MissionState, new byte[] { 0x41 }, NetworkClock.Tick, CancellationToken.None).ConfigureAwait(false));
+
+            Check.True(await guests[1].Guest.SendControlAsync(
+                MessageType.MotionReplicationConfig,
+                Announcement(MotionReplicationWireMode.AnimGraphReplica),
+                NetworkClock.Tick).ConfigureAwait(false));
+            Check.True(await guests[2].Guest.SendControlAsync(
+                MessageType.MotionReplicationConfig,
+                Announcement(MotionReplicationWireMode.TaskNavmesh),
+                NetworkClock.Tick).ConfigureAwait(false));
+            await WaitUntilAsync(
+                () => mirror.StreamingSlots.SequenceEqual(new byte[] { 2 }) &&
+                    Inbox(2).Any(static e => e.Type == MessageType.Goodbye),
+                TimeSpan.FromSeconds(3),
+                "Seat 2 did not start streaming, or seat 3's mode mismatch was not refused.").ConfigureAwait(false);
+            lock (gate) Check.Equal(0, replays.Count);
+
+            // A matching seat's ResyncRequest gets a replay addressed to that seat only.
+            Check.True(await guests[1].Guest.SendControlAsync(
+                MessageType.ResyncRequest, Array.Empty<byte>(), NetworkClock.Tick).ConfigureAwait(false));
+            await WaitUntilAsync(
+                () => { lock (gate) return replays.Count == 1; },
+                TimeSpan.FromSeconds(3),
+                "Seat 2's ResyncRequest was not replayed.").ConfigureAwait(false);
+            lock (gate) Check.Equal((byte)2, replays[0]);
+
+            Check.Equal(1, await mirror.MirrorControlAsync(
+                MessageType.MissionState, new byte[] { 0x42 }, NetworkClock.Tick, CancellationToken.None).ConfigureAwait(false));
+            Check.Equal(0, await mirror.MirrorControlAsync(
+                MessageType.MissionProgression, new byte[] { 0x43 }, NetworkClock.Tick, CancellationToken.None).ConfigureAwait(false));
+            // UDP to a seat needs its endpoint pinned by one datagram from that guest; that datagram is dropped, not applied.
+            Check.True(await guests[1].Guest.SendSnapshotAsync(
+                MessageType.PlayerState, new byte[] { 0x01 }, NetworkClock.Tick).ConfigureAwait(false));
+            await WaitUntilAsync(
+                () => LogContains(baseConfig.LogPath, "Dropped PlayerState from companion seat 2"),
+                TimeSpan.FromSeconds(3),
+                "The companion seat's gameplay frame was not dropped.").ConfigureAwait(false);
+            Check.Equal(1, await mirror.MirrorSnapshotAsync(
+                MessageType.PlayerState, new byte[] { 0x44 }, NetworkClock.Tick, CancellationToken.None).ConfigureAwait(false));
+            await WaitUntilAsync(
+                () => Received(1, MessageType.MissionState, 0x42) && Received(1, MessageType.PlayerState, 0x44),
+                TimeSpan.FromSeconds(3),
+                "Seat 2 did not receive the mirrored host broadcasts.").ConfigureAwait(false);
+            Check.False(Received(1, MessageType.MissionState, 0x41));
+            Check.False(Received(1, MessageType.MissionProgression, 0x43));
+            Check.False(Received(0, MessageType.MissionState, 0x42));
+            Check.False(Received(0, MessageType.PlayerState, 0x44));
+            Check.False(Received(2, MessageType.MissionState, 0x42));
+
+            // A departing seat stops streaming.
+            await guests[1].Stop.CancelAsync().ConfigureAwait(false);
+            await IgnoreCancellationAsync(guests[1].Run).ConfigureAwait(false);
+            await WaitUntilAsync(
+                () => mirror.StreamingSlots.Count == 0,
+                TimeSpan.FromSeconds(3),
+                "Seat 2 kept streaming after it left.").ConfigureAwait(false);
+            Check.Equal(0, await mirror.MirrorControlAsync(
+                MessageType.MissionState, new byte[] { 0x45 }, NetworkClock.Tick, CancellationToken.None).ConfigureAwait(false));
         }
         finally
         {
