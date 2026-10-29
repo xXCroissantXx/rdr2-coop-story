@@ -18,7 +18,8 @@ internal static class HandshakeProtocol
         SessionCredentials credentials,
         Guid hostInstanceId,
         Func<uint> nextSequence,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<Guid, string?>? admitGuest = null)
     {
         // A guest must identify itself first; no arbitrary gameplay frame may establish a TCP connection's identity.
         var envelope = await connection.ReceiveAsync(cancellationToken).ConfigureAwait(false)
@@ -31,6 +32,8 @@ internal static class HandshakeProtocol
         var hello = PayloadJson.Deserialize<HelloPayload>(envelope.Payload.Span);
         // Verify protocol version, session ID, declared role, and HMAC proof before allocating this TCP connection to a guest.
         var rejection = ValidateHello(hello, credentials);
+        // Seat admission runs only after the proof is valid, so an uninvited peer cannot probe or reserve a seat.
+        rejection ??= admitGuest?.Invoke(hello.InstanceId);
         if (rejection is not null)
         {
             var rejected = new HelloAckPayload(

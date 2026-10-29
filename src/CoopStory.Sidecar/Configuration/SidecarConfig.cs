@@ -134,6 +134,12 @@ public sealed record SidecarConfig
             throw new ConfigurationException("Network timing values are inconsistent.");
         }
 
+        if (Network.MaxGuests < 1 || Network.MaxGuests > 3)
+        {
+            throw new ConfigurationException(
+                "network.maxGuests must be between 1 and 3.");
+        }
+
         if (!Safety.StoryModeOnly || !Safety.RefuseOnlineMode)
         {
             throw new ConfigurationException(
@@ -345,6 +351,10 @@ public sealed record NetworkConfig
     public int ReconnectMaxMs { get; init; } = 10000;
 
     public int DiagnosticsIntervalMs { get; init; } = 5000;
+
+    // Guest seats the host accepts (1-3, so 2-4 players in total).
+    // The gameplay runtime still replicates only the primary guest; extra seats are transport-only until per-seat replication lands.
+    public int MaxGuests { get; init; } = 1;
 }
 
 public sealed record SafetyConfig

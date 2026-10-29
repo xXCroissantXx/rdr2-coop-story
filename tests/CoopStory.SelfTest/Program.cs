@@ -90,6 +90,8 @@ internal static class Program
             GhostRecordingStoreAsync),
         ("local game test forwards a synthetic guest to the bridge", LocalGameTestAsync),
         ("TCP authentication and reconnect loopback", TcpReconnectLoopbackAsync),
+        ("host seats three guests, rejects a fourth and hands over primary",
+            MultiGuestSeatLoopbackAsync),
         ("UDP binding rejects spoofing and replay", UdpBindingAndReplayAsync),
         ("UDP world bursts preserve delayed authenticated player snapshots",
             UdpWorldBurstReorderingAsync),
@@ -5105,6 +5107,260 @@ internal static class Program
             }).ConfigureAwait(false);
         Check.False(delivered);
         Check.False(invoked);
+    }
+
+    private static async Task MultiGuestSeatLoopbackAsync()
+    {
+        Check.Throws<ConfigurationException>(() => new SidecarConfig
+        {
+            Network = new NetworkConfig { MaxGuests = 0 }
+        }.Validate());
+        Check.Throws<ConfigurationException>(() => new SidecarConfig
+        {
+            Network = new NetworkConfig { MaxGuests = 4 }
+        }.Validate());
+        Check.Equal(1, new SidecarConfig().Network.MaxGuests);
+
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "CoopStory.SelfTest",
+            Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var credentials = SessionCredentials.Generate();
+        var baseConfig = new SidecarConfig
+        {
+            HostAddress = "127.0.0.1",
+            TcpPort = FindFreeTcpPort(),
+            UdpPort = FindFreeUdpPort(),
+            SessionToken = credentials.ExportToken(),
+            Network = new NetworkConfig
+            {
+                HeartbeatIntervalMs = 100,
+                HeartbeatTimeoutMs = 600,
+                ReconnectMinMs = 100,
+                ReconnectMaxMs = 400,
+                MaxGuests = 3
+            },
+            ProfilePath = Path.Combine(root, "guest-profile.json"),
+            LogPath = Path.Combine(root, "network.jsonl")
+        };
+        var guestConfig = baseConfig with { Role = SessionRole.Guest };
+        var logger = new JsonLineLogger(baseConfig.LogPath);
+        var host = new LanSessionHost(
+            baseConfig with { Role = SessionRole.Host },
+            credentials,
+            logger,
+            IPAddress.Loopback);
+        var gate = new object();
+        // (seat, type, marker) for every frame the host accepted from any seat, and for the primary-only legacy event.
+        var anyReceived = new List<(byte Slot, MessageType Type, byte Marker)>();
+        var primaryReceived = new List<(byte Slot, MessageType Type, byte Marker)>();
+        var seatEvents = new List<(byte Slot, bool Connected)>();
+        var primaryEvents = new List<bool>();
+        host.AnyPeerEnvelopeReceived += (envelope, peer, _) =>
+        {
+            if (envelope.Type != MessageType.Heartbeat && envelope.Payload.Length > 0)
+            {
+                lock (gate) anyReceived.Add((peer.Slot, envelope.Type, envelope.Payload.Span[0]));
+            }
+
+            return ValueTask.CompletedTask;
+        };
+        host.EnvelopeReceived += (envelope, peer, _) =>
+        {
+            if (envelope.Type != MessageType.Heartbeat && envelope.Payload.Length > 0)
+            {
+                lock (gate) primaryReceived.Add((peer.Slot, envelope.Type, envelope.Payload.Span[0]));
+            }
+
+            return ValueTask.CompletedTask;
+        };
+        host.GuestSlotChanged += (peer, connected, _) =>
+        {
+            lock (gate) seatEvents.Add((peer.Slot, connected));
+            return ValueTask.CompletedTask;
+        };
+        host.ConnectionChanged += (connected, _) =>
+        {
+            lock (gate) primaryEvents.Add(connected);
+            return ValueTask.CompletedTask;
+        };
+
+        using var hostStop = new CancellationTokenSource();
+        var hostTask = host.RunAsync(hostStop.Token);
+        var guests = new List<(LanSessionGuest Guest, CancellationTokenSource Stop, Task Run, List<(MessageType Type, byte Marker)> Inbox)>();
+
+        async Task<int> StartGuestAsync()
+        {
+            var guest = new LanSessionGuest(guestConfig, credentials, logger, IPAddress.Loopback);
+            var inbox = new List<(MessageType Type, byte Marker)>();
+            guest.EnvelopeReceived += (envelope, _, _) =>
+            {
+                if (envelope.Type is MessageType.DamageApplied or MessageType.PlayerState &&
+                    envelope.Payload.Length > 0)
+                {
+                    lock (gate) inbox.Add((envelope.Type, envelope.Payload.Span[0]));
+                }
+
+                return ValueTask.CompletedTask;
+            };
+            var stop = new CancellationTokenSource();
+            guests.Add((guest, stop, guest.RunAsync(stop.Token), inbox));
+            return guests.Count - 1;
+        }
+
+        List<(MessageType Type, byte Marker)> Inbox(int guest)
+        {
+            lock (gate) return guests[guest].Inbox.ToList();
+        }
+
+        byte[] SlotsOf(IReadOnlyList<ControlPeerToken> peers) =>
+            peers.Select(static peer => peer.Slot).Order().ToArray();
+
+        try
+        {
+            await Task.Delay(50).ConfigureAwait(false);
+            // Join one at a time so seat numbers follow join order.
+            for (var i = 0; i < 3; i++)
+            {
+                var index = await StartGuestAsync().ConfigureAwait(false);
+                await WaitUntilAsync(
+                    () => guests[index].Guest.IsConnected && host.ConnectedPeers.Count == index + 1,
+                    TimeSpan.FromSeconds(5),
+                    $"Guest {index + 1} did not take a seat.").ConfigureAwait(false);
+            }
+
+            Check.True(SlotsOf(host.ConnectedPeers).SequenceEqual(new byte[] { 1, 2, 3 }));
+            Check.True(host.TryCaptureControlPeer(out var firstPrimary));
+            Check.Equal((byte)1, firstPrimary.Slot);
+            lock (gate)
+            {
+                Check.True(primaryEvents.SequenceEqual(new[] { true }));
+                Check.Equal(3, seatEvents.Count(static e => e.Connected));
+            }
+
+            // A fourth invited guest is refused during the handshake with a clear reason and never disturbs the seated guests.
+            await using (var fourth = new LanSessionGuest(guestConfig, credentials, logger, IPAddress.Loopback))
+            {
+                var rejected = new TaskCompletionSource<string>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                fourth.AuthenticationRejected += (reason, _) =>
+                {
+                    rejected.TrySetResult(reason);
+                    return ValueTask.CompletedTask;
+                };
+                using var fourthStop = new CancellationTokenSource();
+                var fourthTask = fourth.RunAsync(fourthStop.Token);
+                var reason = await rejected.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+                Check.True(reason.Contains("session-full", StringComparison.OrdinalIgnoreCase));
+                Check.False(fourth.IsConnected);
+                await fourthStop.CancelAsync().ConfigureAwait(false);
+                await IgnoreCancellationAsync(fourthTask).ConfigureAwait(false);
+            }
+
+            Check.Equal(3, host.ConnectedPeers.Count);
+
+            // Three guests share 127.0.0.1; each datagram must still land on the sender's own seat.
+            // Send in reverse seat order so the first datagram arrives while every seat is still unpinned and the HMAC alone picks the seat.
+            for (var i = 2; i >= 0; i--)
+            {
+                var marker = (byte)(0x10 + i);
+                Check.True(await guests[i].Guest.SendSnapshotAsync(
+                    MessageType.PlayerState, new[] { marker }, NetworkClock.Tick).ConfigureAwait(false));
+                Check.True(await guests[i].Guest.SendControlAsync(
+                    MessageType.DamageIntent, new[] { (byte)(0x20 + i) }, NetworkClock.Tick).ConfigureAwait(false));
+            }
+
+            await WaitUntilAsync(
+                () => { lock (gate) return anyReceived.Count >= 6; },
+                TimeSpan.FromSeconds(3),
+                "Host did not receive UDP and TCP frames from every seat.").ConfigureAwait(false);
+            lock (gate)
+            {
+                for (var i = 0; i < 3; i++)
+                {
+                    var slot = (byte)(i + 1);
+                    Check.True(anyReceived.Contains((slot, MessageType.PlayerState, (byte)(0x10 + i))));
+                    Check.True(anyReceived.Contains((slot, MessageType.DamageIntent, (byte)(0x20 + i))));
+                }
+
+                // The single-peer runtime keeps seeing only the primary guest.
+                Check.True(primaryReceived.All(static e => e.Slot == 1));
+                Check.Equal(2, primaryReceived.Count);
+            }
+
+            // A targeted control frame reaches only its seat.
+            var seat2 = host.ConnectedPeers.Single(static peer => peer.Slot == 2);
+            Check.True(await host.SendControlAsync(
+                seat2, MessageType.DamageApplied, new byte[] { 0x32 }, NetworkClock.Tick).ConfigureAwait(false));
+            await WaitUntilAsync(
+                () => Inbox(1).Contains((MessageType.DamageApplied, 0x32)),
+                TimeSpan.FromSeconds(2),
+                "Seat 2 did not receive its targeted control frame.").ConfigureAwait(false);
+            // Legacy token-less sends keep targeting the primary guest only.
+            Check.True(await host.SendControlAsync(
+                MessageType.DamageApplied, new byte[] { 0x31 }, NetworkClock.Tick).ConfigureAwait(false));
+            Check.Equal(3, await host.BroadcastControlAsync(
+                MessageType.DamageApplied, new byte[] { 0xA0 }, NetworkClock.Tick).ConfigureAwait(false));
+            Check.Equal(3, await host.BroadcastSnapshotAsync(
+                MessageType.PlayerState, new byte[] { 0xB0 }, NetworkClock.Tick).ConfigureAwait(false));
+            await WaitUntilAsync(
+                () => Enumerable.Range(0, 3).All(i =>
+                    Inbox(i).Contains((MessageType.DamageApplied, 0xA0)) &&
+                    Inbox(i).Contains((MessageType.PlayerState, 0xB0))),
+                TimeSpan.FromSeconds(3),
+                "A broadcast did not reach every seat.").ConfigureAwait(false);
+            Check.True(Inbox(0).Contains((MessageType.DamageApplied, 0x31)));
+            Check.False(Inbox(0).Contains((MessageType.DamageApplied, 0x32)));
+            Check.False(Inbox(1).Contains((MessageType.DamageApplied, 0x31)));
+            Check.False(Inbox(2).Any(static e => e.Marker is 0x31 or 0x32));
+
+            // The primary guest leaves: the runtime sees a disconnect, and the next seated guest reconnects into its old seat as the new primary.
+            var seat2Before = seat2;
+            await guests[0].Stop.CancelAsync().ConfigureAwait(false);
+            await IgnoreCancellationAsync(guests[0].Run).ConfigureAwait(false);
+            await guests[0].Guest.DisposeAsync().ConfigureAwait(false);
+            await WaitUntilAsync(
+                () => host.TryCaptureControlPeer(out var primary) && primary.Slot == 2 &&
+                    host.ConnectedPeers.Count == 2,
+                TimeSpan.FromSeconds(5),
+                "The next seated guest did not take over as primary.").ConfigureAwait(false);
+            Check.False(host.IsControlPeerCurrent(firstPrimary));
+            Check.False(host.IsControlPeerCurrent(seat2Before));
+            Check.True(SlotsOf(host.ConnectedPeers).SequenceEqual(new byte[] { 2, 3 }));
+            Check.True(guests[2].Guest.IsConnected);
+            lock (gate)
+            {
+                Check.True(primaryEvents.SequenceEqual(new[] { true, false, true }));
+                Check.True(seatEvents.Contains(((byte)1, false)));
+                Check.False(seatEvents.Contains(((byte)3, false)));
+            }
+
+            // A newcomer takes the free seat.
+            var late = await StartGuestAsync().ConfigureAwait(false);
+            await WaitUntilAsync(
+                () => guests[late].Guest.IsConnected && host.ConnectedPeers.Count == 3,
+                TimeSpan.FromSeconds(5),
+                "A newcomer could not take the freed seat.").ConfigureAwait(false);
+            Check.True(SlotsOf(host.ConnectedPeers).SequenceEqual(new byte[] { 1, 2, 3 }));
+            Check.True(host.TryCaptureControlPeer(out var stillPrimary));
+            Check.Equal((byte)2, stillPrimary.Slot);
+        }
+        finally
+        {
+            foreach (var (guest, stop, run, _) in guests)
+            {
+                await stop.CancelAsync().ConfigureAwait(false);
+                await IgnoreCancellationAsync(run).ConfigureAwait(false);
+                await guest.DisposeAsync().ConfigureAwait(false);
+                stop.Dispose();
+            }
+
+            await hostStop.CancelAsync().ConfigureAwait(false);
+            await IgnoreCancellationAsync(hostTask).ConfigureAwait(false);
+            await host.DisposeAsync().ConfigureAwait(false);
+            await logger.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     private static async Task TcpReconnectLoopbackAsync()
