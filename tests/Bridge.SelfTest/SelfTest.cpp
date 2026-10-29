@@ -2006,7 +2006,7 @@ void PayloadContracts() {
 }
 
 void AnimationReplicationPayloadContracts() {
-    CHECK(kProtocolVersion == 36U);
+    CHECK(kProtocolVersion == 37U);
     CHECK(
         static_cast<std::uint16_t>(MessageType::PlayerAnimationState) ==
         28U);
@@ -3754,6 +3754,25 @@ public:
     }
     bool QueueNpcAnimation(const NpcAnimationPayload& p) noexcept override {
         npcAnimations.push_back(p); return true;
+    }
+    std::vector<CompanionAvatarCommand> companionCommands;
+    std::vector<std::uint8_t> companionDespawns;
+    std::array<std::optional<Vec3>, 4U> companionPositions{};
+    bool companionApplySucceeds{true};
+    bool ApplyCompanionAvatar(const CompanionAvatarCommand& command) noexcept override {
+        companionCommands.push_back(command);
+        // A placed avatar is at its target at once; a walking one is moved by the test.
+        if (companionApplySucceeds && command.motion == CompanionMotion::Place) {
+            companionPositions[command.seat] = command.target;
+        }
+        return companionApplySucceeds;
+    }
+    void DespawnCompanionAvatar(const std::uint8_t seat) noexcept override {
+        companionDespawns.push_back(seat);
+        companionPositions[seat].reset();
+    }
+    std::optional<Vec3> CompanionAvatarPosition(const std::uint8_t seat) noexcept override {
+        return companionPositions[seat];
     }
     std::uint64_t TickMilliseconds() noexcept override {
         const auto current = tick;
@@ -12034,6 +12053,184 @@ void RuntimeCheckpointRespawnRestoresLifecycle() {
 
 }  // namespace
 
+PlayerStatePayload CompanionTestState(
+    const Vec3 position,
+    const Vec3 velocity = {},
+    const float heading = 0.0F) {
+    PlayerStatePayload state;
+    state.entityId = NetEntityId::Compose(0x5EA7U, 2U);
+    state.slot = PlayerSlot::Guest;
+    state.position = position;
+    state.velocity = velocity;
+    state.heading = heading;
+    return state;
+}
+
+void CompanionPlayerStateWireAndTracker() {
+    const CompanionPlayerStatePayload payload{
+        2U,
+        CompanionTestState({10.0F, 20.0F, 30.0F}, {1.0F, 0.0F, 0.0F}, 90.0F)};
+    const auto bytes = EncodeCompanionPlayerState(payload);
+    CHECK(bytes.size() == kCompanionPlayerStatePayloadSize);
+    CHECK(bytes.size() == 105U);
+    CHECK(bytes[0] == 2U);
+    // Same layout as the managed codec: the seat, then the unchanged PlayerState bytes.
+    const auto state = EncodePlayerState(payload.state);
+    CHECK(std::equal(state.begin(), state.end(), bytes.begin() + 1));
+    const auto decoded = DecodeCompanionPlayerState(bytes);
+    CHECK(decoded.has_value());
+    CHECK(decoded->seat == 2U);
+    CHECK(decoded->state.position.y == 20.0F);
+    for (const std::uint8_t badSeat : {0U, 4U, 255U}) {
+        auto bad = bytes;
+        bad[0] = badSeat;
+        CHECK(!DecodeCompanionPlayerState(bad).has_value());
+    }
+    auto hostSlot = payload;
+    hostSlot.state.slot = PlayerSlot::Host;
+    auto hostBytes = bytes;
+    hostBytes[1 + 8] = 0U;
+    CHECK(!DecodeCompanionPlayerState(hostBytes).has_value());
+    CHECK(!DecodeCompanionPlayerState(std::span{bytes}.first(104U)).has_value());
+    bool threw{};
+    try {
+        (void)EncodeCompanionPlayerState(hostSlot);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(IsKnownMessageType(static_cast<std::uint16_t>(MessageType::CompanionPlayerState)));
+    CHECK(static_cast<std::uint16_t>(MessageType::CompanionPlayerState) == 51U);
+
+    CompanionAvatarTracker tracker;
+    const Vec3 origin{100.0F, 200.0F, 10.0F};
+    // First sample: no avatar yet, so it is placed.
+    auto command = tracker.Observe({3U, CompanionTestState(origin)}, 10U, 1'000U, std::nullopt);
+    CHECK(command.has_value());
+    CHECK(command->seat == 3U);
+    CHECK(command->motion == CompanionMotion::Place);
+    CHECK(Distance(command->target, origin) < 0.001F);
+    // Standing still at the avatar's spot: nothing to do.
+    CHECK(!tracker.Observe({3U, CompanionTestState(origin)}, 11U, 1'050U, origin).has_value());
+    // Walking: lead the target along the velocity.
+    command = tracker.Observe(
+        {3U, CompanionTestState(origin, {1.0F, 0.0F, 0.0F})}, 12U, 1'100U, origin);
+    CHECK(command.has_value());
+    CHECK(command->motion == CompanionMotion::Walk);
+    CHECK(std::abs(command->target.x - (origin.x + kCompanionAvatarLeadSeconds)) < 0.001F);
+    // A reordered older sample is ignored.
+    CHECK(!tracker.Observe(
+        {3U, CompanionTestState(origin, {6.0F, 0.0F, 0.0F})}, 11U, 1'120U, origin).has_value());
+    // Same gait, small move, before the refresh interval: keep the running task.
+    CHECK(!tracker.Observe(
+        {3U, CompanionTestState({origin.x + 0.5F, origin.y, origin.z}, {1.0F, 0.0F, 0.0F})},
+        13U, 1'200U, origin).has_value());
+    // After the interval and a real move, retarget.
+    command = tracker.Observe(
+        {3U, CompanionTestState({origin.x + 3.0F, origin.y, origin.z}, {1.0F, 0.0F, 0.0F})},
+        14U, 1'700U, Vec3{origin.x + 2.0F, origin.y, origin.z});
+    CHECK(command.has_value() && command->motion == CompanionMotion::Walk);
+    // Gait changes refresh at once.
+    command = tracker.Observe(
+        {3U, CompanionTestState({origin.x + 3.0F, origin.y, origin.z}, {3.0F, 0.0F, 0.0F})},
+        15U, 1'710U, Vec3{origin.x + 3.0F, origin.y, origin.z});
+    CHECK(command.has_value() && command->motion == CompanionMotion::Run);
+    command = tracker.Observe(
+        {3U, CompanionTestState({origin.x + 3.0F, origin.y, origin.z}, {6.0F, 0.0F, 0.0F})},
+        16U, 1'720U, Vec3{origin.x + 3.0F, origin.y, origin.z});
+    CHECK(command.has_value() && command->motion == CompanionMotion::Sprint);
+    const Vec3 standing{origin.x + 3.0F, origin.y, origin.z};
+    command = tracker.Observe({3U, CompanionTestState(standing, {}, 0.0F)}, 17U, 1'730U, standing);
+    CHECK(command.has_value() && command->motion == CompanionMotion::Idle);
+    // Idle turns only refresh past the heading tolerance.
+    CHECK(!tracker.Observe({3U, CompanionTestState(standing, {}, 20.0F)}, 18U, 1'740U, standing).has_value());
+    command = tracker.Observe({3U, CompanionTestState(standing, {}, 350.0F - 300.0F)}, 19U, 1'750U, standing);
+    CHECK(command.has_value() && command->motion == CompanionMotion::Idle);
+    CHECK(!tracker.Observe({3U, CompanionTestState(standing, {}, 70.0F)}, 20U, 1'760U, standing).has_value());
+    // Too far from the reported position: place instead of walking.
+    command = tracker.Observe(
+        {3U, CompanionTestState({standing.x + 20.0F, standing.y, standing.z}, {1.0F, 0.0F, 0.0F})},
+        21U, 1'770U, standing);
+    CHECK(command.has_value() && command->motion == CompanionMotion::Place);
+    // Mounted and downed players are held in place.
+    auto mounted = CompanionTestState(standing, {6.0F, 0.0F, 0.0F});
+    mounted.flags = static_cast<std::uint32_t>(PlayerStateFlag::Mounted);
+    CHECK(SelectCompanionMotion(mounted) == CompanionMotion::Place);
+    auto downed = CompanionTestState(standing);
+    downed.lifecycle = PlayerLifecycle::Downed;
+    CHECK(SelectCompanionMotion(downed) == CompanionMotion::Place);
+    // A failed apply forces placement on the next sample.
+    tracker.MarkLost(3U);
+    command = tracker.Observe({3U, CompanionTestState(standing, {}, 70.0F)}, 22U, 1'780U, standing);
+    CHECK(command.has_value() && command->motion == CompanionMotion::Place);
+    // Sequence numbers wrap.
+    CHECK(tracker.Observe({1U, CompanionTestState(origin)}, 0xFFFF'FFFFU, 1'800U, std::nullopt).has_value());
+    CHECK(tracker.Observe({1U, CompanionTestState(origin, {3.0F, 0.0F, 0.0F})}, 0U, 1'810U, origin).has_value());
+    CHECK((tracker.ActiveSeats() == std::vector<std::uint8_t>{1U, 3U}));
+    // Silent seats expire; an expired seat starts over with a placement.
+    CHECK(tracker.Expire(1'780U + kCompanionAvatarTimeoutMilliseconds).empty());
+    CHECK((tracker.Expire(1'811U + kCompanionAvatarTimeoutMilliseconds) == std::vector<std::uint8_t>{1U, 3U}));
+    command = tracker.Observe({3U, CompanionTestState(standing)}, 1U, 9'000U, standing);
+    CHECK(command.has_value() && command->motion == CompanionMotion::Place);
+    CHECK((tracker.Clear() == std::vector<std::uint8_t>{3U}));
+    CHECK(tracker.ActiveSeats().empty());
+    CHECK(!tracker.Observe({0U, CompanionTestState(origin)}, 1U, 9'000U, std::nullopt).has_value());
+}
+
+void RuntimeCompanionAvatarsFollowSeatsAndExpire() {
+    TestFacade facade;
+    TestTransport transport;
+    transport.injectRemoteState = false;
+    BridgeRuntime runtime{facade, transport};
+    const GameIdentity supported{
+        std::string{kSupportedExecutableName},
+        std::string{kSupportedFileVersion},
+        std::string{kSupportedExecutableSha256}};
+    std::string error;
+    CHECK(runtime.Start(supported, error));
+    runtime.Tick();
+    CHECK(runtime.LocalSlot().has_value());
+
+    std::uint32_t sequence{100U};
+    const auto push = [&](const std::uint8_t seat, const PlayerStatePayload& state) {
+        Frame frame;
+        frame.header.type = MessageType::CompanionPlayerState;
+        frame.header.sequence = ++sequence;
+        frame.payload = EncodeCompanionPlayerState({seat, state});
+        transport.inbound.push_back(std::move(frame));
+    };
+    push(2U, CompanionTestState({1.0F, 2.0F, 3.0F}));
+    push(3U, CompanionTestState({4.0F, 5.0F, 6.0F}));
+    runtime.Tick();
+    CHECK(facade.companionCommands.size() == 2U);
+    CHECK(facade.companionCommands[0].seat == 2U);
+    CHECK(facade.companionCommands[1].seat == 3U);
+    CHECK(facade.companionCommands[1].motion == CompanionMotion::Place);
+
+    // A malformed seat and an online-mode sample never reach the game.
+    Frame invalid;
+    invalid.header.type = MessageType::CompanionPlayerState;
+    invalid.header.sequence = ++sequence;
+    invalid.payload = EncodeCompanionPlayerState({2U, CompanionTestState({1.0F, 2.0F, 3.0F})});
+    invalid.payload[0] = 0U;
+    transport.inbound.push_back(std::move(invalid));
+    auto online = CompanionTestState({50.0F, 2.0F, 3.0F});
+    online.flags = static_cast<std::uint32_t>(PlayerStateFlag::OnlineModeDetected);
+    push(2U, online);
+    runtime.Tick();
+    CHECK(facade.companionCommands.size() == 2U);
+
+    // Seat 2 keeps talking; seat 3 goes silent and is removed after the timeout.
+    for (int step = 0; step < 6; ++step) {
+        facade.tick += 1'000U;
+        push(2U, CompanionTestState({1.0F, 2.0F, 3.0F}, {}, static_cast<float>(step * 40)));
+        runtime.Tick();
+    }
+    CHECK((facade.companionDespawns == std::vector<std::uint8_t>{3U}));
+    CHECK(facade.companionPositions[2].has_value());
+    CHECK(!facade.companionPositions[3].has_value());
+}
+
 int main() {
     const std::vector<std::pair<std::string_view, std::function<void()>>> tests{
         {"AmbientEncounterCoordinatorPolicy", AmbientEncounterCoordinatorPolicy},
@@ -12049,6 +12246,9 @@ int main() {
         {"SequenceAndEntityIds", SequenceAndEntityIds},
         {"WorldMirrorLifecycle", WorldMirrorLifecycle},
         {"NpcAnimationWireAndJournal", NpcAnimationWireAndJournal},
+        {"CompanionPlayerStateWireAndTracker", CompanionPlayerStateWireAndTracker},
+        {"RuntimeCompanionAvatarsFollowSeatsAndExpire",
+         RuntimeCompanionAvatarsFollowSeatsAndExpire},
         {"WorldProxyCombatMotionAndRecovery", WorldProxyCombatMotionAndRecovery},
         {"WorldProxyMountRetriesUntilConfirmed", WorldProxyMountRetriesUntilConfirmed},
         {"TrainCarsReplicateAndRecover", TrainCarsReplicateAndRecover},

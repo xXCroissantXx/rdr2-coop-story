@@ -9,28 +9,35 @@ namespace CoopStory.Sidecar.Session;
 // receives the host's coherent replay on its ResyncRequest, and then receives a copy of the host-authored broadcast state.
 // Seat-specific flows (mission barriers and completions, campaign grants, interactions, damage) are never copied,
 // so these guests stay companion-only, the same fallback a non-matching primary guest already uses.
-// Gameplay sent by these guests is dropped until per-seat player replication exists.
+// Player states are relayed between seats as seat-tagged CompanionPlayerState: a companion's state goes to the host game,
+// the primary guest and the other companions; the primary guest's state goes to the companions. Each game shows those
+// players as simple companion avatars. Any other gameplay a companion sends is dropped.
 internal sealed class SecondarySeatMirror
 {
     private readonly object _sync = new();
     private readonly IMultiPeerLanSession _network;
     private readonly MotionReplicationWireMode _localMode;
     private readonly Func<ControlPeerToken, CancellationToken, ValueTask<bool>> _replayToSeat;
+    private readonly Func<byte[], bool> _deliverToLocalBridge;
     private readonly JsonLineLogger _logger;
     // Seats that are connected and not primary; true once their motion mode matched.
     private readonly Dictionary<byte, (ControlPeerToken Peer, bool Streaming)> _seats = new();
     private uint _announcementRevision;
     private int _droppedGuestFrames;
+    private int _rejectedPlayerStates;
 
     public SecondarySeatMirror(
         IMultiPeerLanSession network,
         MotionReplicationWireMode localMode,
         Func<ControlPeerToken, CancellationToken, ValueTask<bool>> replayToSeat,
+        Func<byte[], bool> deliverToLocalBridge,
         JsonLineLogger logger)
     {
         _network = network ?? throw new ArgumentNullException(nameof(network));
         _localMode = localMode;
         _replayToSeat = replayToSeat ?? throw new ArgumentNullException(nameof(replayToSeat));
+        _deliverToLocalBridge = deliverToLocalBridge ??
+            throw new ArgumentNullException(nameof(deliverToLocalBridge));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -138,8 +145,27 @@ internal sealed class SecondarySeatMirror
             streaming = known && seat.Streaming;
         }
 
-        if (!known || envelope.Type == MessageType.Heartbeat)
+        if (!known)
         {
+            // The runtime handles the primary guest; only its player state is also relayed to the companions.
+            if (envelope.Type == MessageType.PlayerState && IsPrimary(peer))
+            {
+                await RelayPlayerStateAsync(envelope, peer, toLocalBridge: false, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            return;
+        }
+
+        if (envelope.Type == MessageType.Heartbeat)
+        {
+            return;
+        }
+
+        if (envelope.Type == MessageType.PlayerState && streaming)
+        {
+            await RelayPlayerStateAsync(envelope, peer, toLocalBridge: true, cancellationToken)
+                .ConfigureAwait(false);
             return;
         }
 
@@ -175,7 +201,7 @@ internal sealed class SecondarySeatMirror
         {
             await _logger.InfoAsync(
                 "network.seat.companion-frame-dropped",
-                $"Dropped {envelope.Type} from companion seat {peer.Slot}; per-seat player replication is not implemented yet.",
+                $"Dropped {envelope.Type} from companion seat {peer.Slot}; companion seats replicate only their player state.",
                 new Dictionary<string, object?>
                 {
                     ["slot"] = peer.Slot,
@@ -226,6 +252,77 @@ internal sealed class SecondarySeatMirror
         foreach (var peer in CaptureStreamingPeers())
         {
             if (await _network.SendSnapshotAsync(peer, type, payload, tick, cancellationToken)
+                    .ConfigureAwait(false))
+            {
+                delivered++;
+            }
+        }
+
+        return delivered;
+    }
+
+    // Re-tag a guest's own PlayerState with its seat and send it to every player who does not already see that guest.
+    // Returns how many remote seats accepted the relayed frame.
+    internal async ValueTask<int> RelayPlayerStateAsync(
+        ProtocolEnvelope envelope,
+        ControlPeerToken source,
+        bool toLocalBridge,
+        CancellationToken cancellationToken)
+    {
+        byte[] relayed;
+        try
+        {
+            var state = BinaryPayloadCodec.DecodePlayerState(envelope.Payload.Span);
+            if ((state.Flags & PlayerStateFlags.OnlineModeDetected) != 0)
+            {
+                throw new ProtocolException("Guest reported online mode.");
+            }
+
+            relayed = CompanionPlayerStateCodec.Encode(
+                new CompanionPlayerStatePayload(source.Slot, state));
+        }
+        catch (ProtocolException exception)
+        {
+            var count = Interlocked.Increment(ref _rejectedPlayerStates);
+            if (count <= 3 || (count & (count - 1)) == 0)
+            {
+                await _logger.WarningAsync(
+                    "network.seat.player-state-rejected",
+                    $"Did not relay a PlayerState from seat {source.Slot}: {exception.Message}",
+                    new Dictionary<string, object?>
+                    {
+                        ["slot"] = source.Slot,
+                        ["rejectionCount"] = count
+                    },
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            return 0;
+        }
+
+        // The host game already shows the primary guest through the full two-player replica.
+        if (toLocalBridge)
+        {
+            _ = _deliverToLocalBridge(relayed);
+        }
+
+        var targets = CaptureStreamingPeers()
+            .Where(peer => peer.Slot != source.Slot)
+            .ToList();
+        if (toLocalBridge && _network.TryCaptureControlPeer(out var primary))
+        {
+            targets.Add(primary);
+        }
+
+        var delivered = 0;
+        foreach (var peer in targets)
+        {
+            if (await _network.SendSnapshotAsync(
+                        peer,
+                        MessageType.CompanionPlayerState,
+                        relayed,
+                        envelope.Tick,
+                        cancellationToken)
                     .ConfigureAwait(false))
             {
                 delivered++;

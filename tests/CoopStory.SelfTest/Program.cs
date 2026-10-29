@@ -94,6 +94,10 @@ internal static class Program
             MultiGuestSeatLoopbackAsync),
         ("companion seats negotiate, replay and receive only host broadcasts",
             SecondarySeatMirrorLoopbackAsync),
+        ("companion player state wire, queue and authorization rules",
+            CompanionPlayerStateContractsAsync),
+        ("host relays player states between all four seats",
+            CompanionPlayerRelayLoopbackAsync),
         ("UDP binding rejects spoofing and replay", UdpBindingAndReplayAsync),
         ("UDP world bursts preserve delayed authenticated player snapshots",
             UdpWorldBurstReorderingAsync),
@@ -471,7 +475,7 @@ internal static class Program
 
     private static Task MissionCinematicProtocolAsync()
     {
-        Check.Equal((ushort)36, ProtocolConstants.Version);
+        Check.Equal((ushort)37, ProtocolConstants.Version);
         Check.Equal((ushort)35, (ushort)MessageType.MissionCinematicState);
         Check.Equal((ushort)36, (ushort)MessageType.MissionCinematicAction);
 
@@ -630,7 +634,7 @@ internal static class Program
 
     private static Task AppearanceAndAnimSceneProtocolAsync()
     {
-        Check.Equal((ushort)36, ProtocolConstants.Version);
+        Check.Equal((ushort)37, ProtocolConstants.Version);
         Check.Equal((ushort)37, (ushort)MessageType.PlayerAppearanceState);
         Check.Equal((ushort)38, (ushort)MessageType.AnimSceneReplicaState);
         Check.Equal((ushort)39, (ushort)MessageType.AnimSceneDefinition);
@@ -1950,7 +1954,7 @@ internal static class Program
 
     private static Task PlayerActionProtocolAsync()
     {
-        Check.Equal((ushort)36, ProtocolConstants.Version);
+        Check.Equal((ushort)37, ProtocolConstants.Version);
         Check.Equal((ushort)30, (ushort)MessageType.PlayerAction);
 
         var guestId = NetEntityId.Create(0x11223344, 2);
@@ -2216,7 +2220,7 @@ internal static class Program
 
     private static Task InteractionAuthorityProtocolAsync()
     {
-        Check.Equal((ushort)36, ProtocolConstants.Version);
+        Check.Equal((ushort)37, ProtocolConstants.Version);
         Check.Equal((ushort)32, (ushort)MessageType.InteractionIntent);
         Check.Equal((ushort)33, (ushort)MessageType.InteractionResult);
         Check.Equal((ushort)34, (ushort)MessageType.RestraintState);
@@ -3277,7 +3281,7 @@ internal static class Program
 
     private static Task AnimationReplicationPayloadsAsync()
     {
-        Check.Equal((ushort)36, ProtocolConstants.Version);
+        Check.Equal((ushort)37, ProtocolConstants.Version);
         Check.Equal((ushort)28, (ushort)MessageType.PlayerAnimationState);
         Check.Equal((ushort)29, (ushort)MessageType.MotionReplicationConfig);
 
@@ -3497,7 +3501,7 @@ internal static class Program
 
     private static Task WorldAndEquipmentAsync()
     {
-        Check.Equal((ushort)36, ProtocolConstants.Version);
+        Check.Equal((ushort)37, ProtocolConstants.Version);
         Check.Equal((ushort)23, (ushort)MessageType.WorldState);
         Check.Equal((ushort)24, (ushort)MessageType.EquipmentState);
         Check.Equal((ushort)25, (ushort)MessageType.PauseVote);
@@ -5421,6 +5425,7 @@ internal static class Program
             IPAddress.Loopback);
         var gate = new object();
         var replays = new List<byte>();
+        var localBridge = new List<byte[]>();
         var mirror = new SecondarySeatMirror(
             host,
             MotionReplicationWireMode.AnimGraphReplica,
@@ -5428,6 +5433,11 @@ internal static class Program
             {
                 lock (gate) replays.Add(peer.Slot);
                 return ValueTask.FromResult(true);
+            },
+            payload =>
+            {
+                lock (gate) localBridge.Add(payload);
+                return true;
             },
             logger);
         host.GuestSlotChanged += mirror.OnSeatChangedAsync;
@@ -5529,9 +5539,9 @@ internal static class Program
                 MessageType.MissionProgression, new byte[] { 0x43 }, NetworkClock.Tick, CancellationToken.None).ConfigureAwait(false));
             // UDP to a seat needs its endpoint pinned by one datagram from that guest; that datagram is dropped, not applied.
             Check.True(await guests[1].Guest.SendSnapshotAsync(
-                MessageType.PlayerState, new byte[] { 0x01 }, NetworkClock.Tick).ConfigureAwait(false));
+                MessageType.PlayerAnimationState, new byte[] { 0x01 }, NetworkClock.Tick).ConfigureAwait(false));
             await WaitUntilAsync(
-                () => LogContains(baseConfig.LogPath, "Dropped PlayerState from companion seat 2"),
+                () => LogContains(baseConfig.LogPath, "Dropped PlayerAnimationState from companion seat 2"),
                 TimeSpan.FromSeconds(3),
                 "The companion seat's gameplay frame was not dropped.").ConfigureAwait(false);
             Check.Equal(1, await mirror.MirrorSnapshotAsync(
@@ -5555,6 +5565,258 @@ internal static class Program
                 "Seat 2 kept streaming after it left.").ConfigureAwait(false);
             Check.Equal(0, await mirror.MirrorControlAsync(
                 MessageType.MissionState, new byte[] { 0x45 }, NetworkClock.Tick, CancellationToken.None).ConfigureAwait(false));
+        }
+        finally
+        {
+            foreach (var (guest, stop, run, _) in guests)
+            {
+                await stop.CancelAsync().ConfigureAwait(false);
+                await IgnoreCancellationAsync(run).ConfigureAwait(false);
+                await guest.DisposeAsync().ConfigureAwait(false);
+                stop.Dispose();
+            }
+
+            await hostStop.CancelAsync().ConfigureAwait(false);
+            await IgnoreCancellationAsync(hostTask).ConfigureAwait(false);
+            await host.DisposeAsync().ConfigureAwait(false);
+            await logger.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static PlayerStatePayload CompanionTestState(float x, PlayerStateFlags flags = PlayerStateFlags.None) =>
+        new(
+            new NetEntityId(0x0000000100000002UL),
+            (byte)SessionRole.Guest,
+            PlayerLifecycle.Alive,
+            new Vector3(x, 2, 3),
+            Vector3.Zero,
+            90f,
+            1f,
+            flags);
+
+    private static async Task CompanionPlayerStateContractsAsync()
+    {
+        Check.Equal((ushort)51, (ushort)MessageType.CompanionPlayerState);
+        var payload = new CompanionPlayerStatePayload(2, CompanionTestState(10));
+        var bytes = CompanionPlayerStateCodec.Encode(payload);
+        Check.Equal(105, bytes.Length);
+        Check.Equal((byte)2, bytes[0]);
+        // Same layout as the bridge: the seat, then the unchanged PlayerState bytes.
+        Check.True(bytes.AsSpan(1).SequenceEqual(BinaryPayloadCodec.EncodePlayerState(payload.State)));
+        Check.Equal(payload, CompanionPlayerStateCodec.Decode(bytes));
+        Check.True(CompanionPlayerStateCodec.TryReadSeat(bytes, out var seat) && seat == 2);
+        foreach (var badSeat in new byte[] { 0, 4, 255 })
+        {
+            var bad = bytes.ToArray();
+            bad[0] = badSeat;
+            Check.Throws<ProtocolException>(() => CompanionPlayerStateCodec.Decode(bad));
+            Check.False(CompanionPlayerStateCodec.TryReadSeat(bad, out _));
+        }
+
+        Check.Throws<ProtocolException>(() => CompanionPlayerStateCodec.Encode(
+            payload with { State = payload.State with { Slot = (byte)SessionRole.Host } }));
+        Check.Throws<ProtocolException>(() => CompanionPlayerStateCodec.Encode(payload with { Seat = 0 }));
+        Check.Throws<ProtocolException>(() => CompanionPlayerStateCodec.Decode(bytes.AsSpan(0, 104)));
+        var hostSlot = bytes.ToArray();
+        hostSlot[1 + 8] = (byte)SessionRole.Host;
+        Check.Throws<ProtocolException>(() => CompanionPlayerStateCodec.Decode(hostSlot));
+
+        // Only a guest accepts these, only from the host; no game bridge may originate one.
+        Check.True(SidecarRuntime.IsPeerMessageAuthorized(SessionRole.Guest, MessageType.CompanionPlayerState));
+        Check.False(SidecarRuntime.IsPeerMessageAuthorized(SessionRole.Host, MessageType.CompanionPlayerState));
+        Check.False(SidecarRuntime.IsLocalBridgeMessageAuthorized(SessionRole.Host, MessageType.CompanionPlayerState));
+        Check.False(SidecarRuntime.IsLocalBridgeMessageAuthorized(SessionRole.Guest, MessageType.CompanionPlayerState));
+        Check.False(SecondarySeatMirror.IsMirroredType(MessageType.CompanionPlayerState));
+        Check.True(SidecarRuntime.IsReplaceableBridgeDeliveryType(MessageType.CompanionPlayerState));
+        var envelope = new ProtocolEnvelope(MessageType.CompanionPlayerState, 1, 1000, bytes);
+        SidecarRuntime.ValidateBinaryControlPayload(envelope);
+        Check.Throws<ProtocolException>(() => SidecarRuntime.ValidateBinaryControlPayload(envelope with { Payload = hostSlot }));
+
+        // The bridge queue keeps the newest sample per seat, never one seat's sample in place of another's.
+        var delivered = new List<(byte Seat, float X)>();
+        var gate = new object();
+        var pump = new NetworkBridgeDeliveryPump(e =>
+        {
+            var decoded = CompanionPlayerStateCodec.Decode(e.Payload.Span);
+            lock (gate) delivered.Add((decoded.Seat, decoded.State.Position.X));
+            return ValueTask.FromResult(true);
+        }, criticalCapacity: 8);
+        ProtocolEnvelope Frame(uint sequence, byte frameSeat, float x) =>
+            new(MessageType.CompanionPlayerState, sequence, 1000,
+                CompanionPlayerStateCodec.Encode(new CompanionPlayerStatePayload(frameSeat, CompanionTestState(x))));
+        Check.Equal(NetworkBridgeEnqueueDisposition.Queued, pump.TryEnqueue(Frame(1, 2, 1)).Disposition);
+        Check.Equal(NetworkBridgeEnqueueDisposition.Queued, pump.TryEnqueue(Frame(2, 3, 2)).Disposition);
+        Check.Equal(NetworkBridgeEnqueueDisposition.Coalesced, pump.TryEnqueue(Frame(3, 2, 3)).Disposition);
+        // An older sample for a seat does not replace its newer pending one.
+        Check.Equal(NetworkBridgeEnqueueDisposition.Coalesced, pump.TryEnqueue(Frame(2, 2, 99)).Disposition);
+        using var stop = new CancellationTokenSource();
+        var run = pump.RunAsync(stop.Token);
+        await WaitUntilAsync(() => { lock (gate) return delivered.Count == 2; },
+            TimeSpan.FromSeconds(2), "Companion queue did not drain.").ConfigureAwait(false);
+        await stop.CancelAsync().ConfigureAwait(false);
+        await run.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        lock (gate)
+        {
+            Check.True(delivered.Contains(((byte)2, 3f)));
+            Check.True(delivered.Contains(((byte)3, 2f)));
+        }
+    }
+
+    private static async Task CompanionPlayerRelayLoopbackAsync()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "CoopStory.SelfTest",
+            Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var credentials = SessionCredentials.Generate();
+        var baseConfig = new SidecarConfig
+        {
+            HostAddress = "127.0.0.1",
+            TcpPort = FindFreeTcpPort(),
+            UdpPort = FindFreeUdpPort(),
+            SessionToken = credentials.ExportToken(),
+            Network = new NetworkConfig
+            {
+                HeartbeatIntervalMs = 100,
+                HeartbeatTimeoutMs = 600,
+                ReconnectMinMs = 100,
+                ReconnectMaxMs = 400,
+                MaxGuests = 3
+            },
+            ProfilePath = Path.Combine(root, "guest-profile.json"),
+            LogPath = Path.Combine(root, "network.jsonl")
+        };
+        var guestConfig = baseConfig with { Role = SessionRole.Guest };
+        var logger = new JsonLineLogger(baseConfig.LogPath);
+        var host = new LanSessionHost(
+            baseConfig with { Role = SessionRole.Host },
+            credentials,
+            logger,
+            IPAddress.Loopback);
+        var gate = new object();
+        var localBridge = new List<CompanionPlayerStatePayload>();
+        var mirror = new SecondarySeatMirror(
+            host,
+            MotionReplicationWireMode.AnimGraphReplica,
+            (_, _) => ValueTask.FromResult(true),
+            payload =>
+            {
+                lock (gate) localBridge.Add(CompanionPlayerStateCodec.Decode(payload));
+                return true;
+            },
+            logger);
+        host.GuestSlotChanged += mirror.OnSeatChangedAsync;
+        host.AnyPeerEnvelopeReceived += mirror.OnEnvelopeAsync;
+        using var hostStop = new CancellationTokenSource();
+        var hostTask = host.RunAsync(hostStop.Token);
+        var guests = new List<(LanSessionGuest Guest, CancellationTokenSource Stop, Task Run, List<CompanionPlayerStatePayload> Inbox)>();
+        try
+        {
+            await Task.Delay(50).ConfigureAwait(false);
+            for (var i = 0; i < 3; i++)
+            {
+                var guest = new LanSessionGuest(guestConfig, credentials, logger, IPAddress.Loopback);
+                var inbox = new List<CompanionPlayerStatePayload>();
+                guest.EnvelopeReceived += (envelope, _, _) =>
+                {
+                    if (envelope.Type == MessageType.CompanionPlayerState)
+                    {
+                        var decoded = CompanionPlayerStateCodec.Decode(envelope.Payload.Span);
+                        lock (gate) inbox.Add(decoded);
+                    }
+
+                    return ValueTask.CompletedTask;
+                };
+                var stop = new CancellationTokenSource();
+                guests.Add((guest, stop, guest.RunAsync(stop.Token), inbox));
+                var index = i;
+                await WaitUntilAsync(
+                    () => guest.IsConnected && host.ConnectedPeers.Count == index + 1,
+                    TimeSpan.FromSeconds(5),
+                    $"Guest {index + 1} did not take a seat.").ConfigureAwait(false);
+            }
+
+            var announcement = AnimationReplicationPayloadCodec.EncodeMotionReplicationConfig(
+                new MotionReplicationConfigPayload(
+                    AnimationReplicationPayloadCodec.MotionReplicationConfigSchemaVersion,
+                    MotionReplicationWireMode.AnimGraphReplica,
+                    MotionReplicationConfigFlags.None,
+                    1));
+            for (var i = 1; i < 3; i++)
+            {
+                Check.True(await guests[i].Guest.SendControlAsync(
+                    MessageType.MotionReplicationConfig, announcement, NetworkClock.Tick).ConfigureAwait(false));
+            }
+
+            await WaitUntilAsync(
+                () => mirror.StreamingSlots.SequenceEqual(new byte[] { 2, 3 }),
+                TimeSpan.FromSeconds(3),
+                "Companion seats did not start streaming.").ConfigureAwait(false);
+
+            List<CompanionPlayerStatePayload> Inbox(int guest)
+            {
+                lock (gate) return guests[guest].Inbox.ToList();
+            }
+
+            bool Has(IEnumerable<CompanionPlayerStatePayload> frames, byte frameSeat, float x) =>
+                frames.Any(f => f.Seat == frameSeat && Math.Abs(f.State.Position.X - x) < 0.001f);
+
+            // Every guest sends one UDP PlayerState; that also pins its UDP endpoint for the relay back to it.
+            for (var i = 0; i < 3; i++)
+            {
+                Check.True(await guests[i].Guest.SendSnapshotAsync(
+                    MessageType.PlayerState,
+                    BinaryPayloadCodec.EncodePlayerState(CompanionTestState(10 + i)),
+                    NetworkClock.Tick).ConfigureAwait(false));
+            }
+
+            // Datagrams sent before a seat's endpoint was pinned can miss it, so send a second round.
+            await Task.Delay(100).ConfigureAwait(false);
+            for (var i = 0; i < 3; i++)
+            {
+                Check.True(await guests[i].Guest.SendSnapshotAsync(
+                    MessageType.PlayerState,
+                    BinaryPayloadCodec.EncodePlayerState(CompanionTestState(20 + i)),
+                    NetworkClock.Tick).ConfigureAwait(false));
+            }
+
+            await WaitUntilAsync(
+                () => Has(Inbox(0), 2, 21) && Has(Inbox(0), 3, 22) &&
+                    Has(Inbox(1), 1, 20) && Has(Inbox(1), 3, 22) &&
+                    Has(Inbox(2), 1, 20) && Has(Inbox(2), 2, 21),
+                TimeSpan.FromSeconds(3),
+                "A player state was not relayed to every other seat.").ConfigureAwait(false);
+            lock (gate)
+            {
+                // The host game gets the companions; it already shows the primary guest as the full replica.
+                Check.True(Has(localBridge, 2, 21) && Has(localBridge, 3, 22));
+                Check.False(localBridge.Any(static f => f.Seat == 1));
+            }
+
+            // Nobody is shown themselves.
+            for (var i = 0; i < 3; i++)
+            {
+                Check.False(Inbox(i).Any(f => f.Seat == i + 1));
+            }
+
+            // A companion's invalid or online-mode state is not relayed anywhere.
+            int CountAll() => Enumerable.Range(0, 3).Sum(i => Inbox(i).Count) + localBridge.Count;
+            var before = CountAll();
+            var hostSlotted = BinaryPayloadCodec.EncodePlayerState(
+                CompanionTestState(30) with { Slot = (byte)SessionRole.Host });
+            Check.True(await guests[1].Guest.SendSnapshotAsync(
+                MessageType.PlayerState, hostSlotted, NetworkClock.Tick).ConfigureAwait(false));
+            Check.True(await guests[1].Guest.SendSnapshotAsync(
+                MessageType.PlayerState,
+                BinaryPayloadCodec.EncodePlayerState(CompanionTestState(31, PlayerStateFlags.OnlineModeDetected)),
+                NetworkClock.Tick).ConfigureAwait(false));
+            await WaitUntilAsync(
+                () => LogContains(baseConfig.LogPath, "Guest reported online mode"),
+                TimeSpan.FromSeconds(3),
+                "Online-mode PlayerState was not rejected.").ConfigureAwait(false);
+            Check.True(LogContains(baseConfig.LogPath, "Did not relay a PlayerState from seat 2"));
+            lock (gate) Check.Equal(before, CountAll());
         }
         finally
         {

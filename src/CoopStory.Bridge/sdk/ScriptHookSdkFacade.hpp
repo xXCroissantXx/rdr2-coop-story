@@ -147,6 +147,11 @@ public:
         float restoredHealthFraction) noexcept override;
     [[nodiscard]] bool ApplyRemoteIdentity(
         const PlayerIdentityPayload& identity) noexcept override;
+    [[nodiscard]] bool ApplyCompanionAvatar(
+        const CompanionAvatarCommand& command) noexcept override;
+    void DespawnCompanionAvatar(std::uint8_t seat) noexcept override;
+    [[nodiscard]] std::optional<Vec3> CompanionAvatarPosition(
+        std::uint8_t seat) noexcept override;
     [[nodiscard]] bool ApplyRemoteAppearance(
         const PlayerAppearanceStatePayload& appearance) noexcept override;
     [[nodiscard]] bool ApplyWorldState(
@@ -243,6 +248,12 @@ private:
     };
     bool abandonNativeCleanupAfterFatal_{};
     std::optional<AmbientEncounterPresentation> ambientEncounterPresentation_{};
+    // Bridge-owned peds for players beyond the two-player replica, indexed by transport seat.
+    struct CompanionAvatar final {
+        int ped{};
+        int blip{};
+    };
+    std::array<CompanionAvatar, kMaxCompanionSeat + 1U> companionAvatars_{};
     std::uint32_t ambientEncounterCooldownScriptId_{};
     std::uint64_t ambientEncounterCooldownUntilMs_{};
     bool remoteTransformNativeFaultLogged_{};

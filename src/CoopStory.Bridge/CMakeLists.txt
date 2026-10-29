@@ -38,6 +38,7 @@ add_library(CoopStory.Bridge.Core STATIC
     src/AnimationReplicationCodec.cpp
     src/NpcAnimation.cpp
     src/BridgeRuntime.cpp
+    src/CompanionAvatars.cpp
     src/EntityRegistry.cpp
     src/FrameCodec.cpp
     src/MenuController.cpp

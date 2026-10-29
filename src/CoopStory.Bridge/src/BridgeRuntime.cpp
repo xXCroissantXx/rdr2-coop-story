@@ -1029,6 +1029,7 @@ void BridgeRuntime::SendHello(const bool reconnect) {
     }
     ResetGuestWorldMirror();
     DespawnRemoteReplica();
+    ClearCompanionAvatars();
     // DespawnRemoteReplica resets hybrid-only state when no exact definition exists.
     // The mission cinematic reconnect snapshot is independent from that optional definition and must survive repeated Hello attempts too.
     hostAnimSceneReconnectPending_ = preserveHostCinematic;
@@ -1638,6 +1639,46 @@ void BridgeRuntime::ApplyRemotePlayerState(
         players_.SetDowned(state.slot);
     } else if (state.lifecycle == PlayerLifecycle::Alive) {
         players_.SetAlive(state.slot, state.healthFraction);
+    }
+}
+
+void BridgeRuntime::HandleCompanionPlayerState(
+    const Frame& frame,
+    const CompanionPlayerStatePayload& payload) {
+    // Companions exist only inside an active session, and they are ordinary players: an online-mode flag ends the stream like any PlayerState.
+    if (!localSlot_.has_value() ||
+        (payload.state.flags &
+         static_cast<std::uint32_t>(PlayerStateFlag::OnlineModeDetected)) !=
+            0U) {
+        return;
+    }
+    const auto command = companions_.Observe(
+        payload,
+        frame.header.sequence,
+        facade_.TickMilliseconds(),
+        facade_.CompanionAvatarPosition(payload.seat));
+    if (command.has_value() && !facade_.ApplyCompanionAvatar(*command)) {
+        companions_.MarkLost(payload.seat);
+    }
+}
+
+void BridgeRuntime::TickCompanionAvatars(const std::uint64_t nowMs) {
+    for (const auto seat : companions_.Expire(nowMs)) {
+        facade_.DespawnCompanionAvatar(seat);
+        if (diagnostics_) {
+            facade_.Log(
+                "[COMPANION] seat " + std::to_string(seat) +
+                " timed out; avatar removed");
+        }
+    }
+}
+
+void BridgeRuntime::ClearCompanionAvatars() noexcept {
+    try {
+        for (const auto seat : companions_.Clear()) {
+            facade_.DespawnCompanionAvatar(seat);
+        }
+    } catch (...) {
     }
 }
 
@@ -3077,6 +3118,8 @@ void BridgeRuntime::Tick() {
         }
     }
 
+    lastTickStage_ = "companion-avatars";
+    TickCompanionAvatars(now);
     lastTickStage_ = "mission-camera";
     if (localSlot_.has_value()) {
         TickMissionCamera(*localSlot_, now);
@@ -8794,6 +8837,7 @@ void BridgeRuntime::HandleInboundFrame(const Frame& frame) {
                         ResetGuestWorldMirror();
                     }
                     DespawnRemoteReplica();
+                    ClearCompanionAvatars();
                     hostInviteCode_.clear();
                     ++sessionEpoch_;
                     if (sessionEpoch_ == 0U) {
@@ -9296,6 +9340,16 @@ void BridgeRuntime::HandleInboundFrame(const Frame& frame) {
                 DecodePauseVote(frame.payload);
             if (pause.has_value()) {
                 HandlePauseVote(frame, *pause);
+            }
+            break;
+        }
+        case MessageType::CompanionPlayerState: {
+            const auto companion =
+                DecodeCompanionPlayerState(frame.payload);
+            if (companion.has_value()) {
+                HandleCompanionPlayerState(frame, *companion);
+            } else if (diagnostics_) {
+                facade_.Log("rejected invalid companion player state");
             }
             break;
         }

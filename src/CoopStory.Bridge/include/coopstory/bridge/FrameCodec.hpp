@@ -17,7 +17,7 @@ namespace coopstory::bridge {
 // Every message starts with this small header.
 // The rest of the message holds the data for that message type.
 inline constexpr std::uint32_t kFrameMagic = 0x50433252U;  // LE bytes: "R2CP"
-inline constexpr std::uint16_t kProtocolVersion = 36U;
+inline constexpr std::uint16_t kProtocolVersion = 37U;
 inline constexpr std::size_t kFrameHeaderSize = 24U;
 inline constexpr std::uint32_t kMaximumFramePayload = 1'048'576U;
 inline constexpr std::size_t kMaximumUdpDatagram = 1'200U;
@@ -78,6 +78,8 @@ enum class MessageType : std::uint16_t {
     AmbientEncounterProposal = 48,
     AmbientEncounterState = 49,
     NpcAnimation = 50,
+    // Host -> every other player: a seat-tagged guest PlayerState for sessions with more than two players.
+    CompanionPlayerState = 51,
 };
 
 [[nodiscard]] bool IsKnownMessageType(std::uint16_t value) noexcept;

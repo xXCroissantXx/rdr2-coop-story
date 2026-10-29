@@ -92,6 +92,11 @@ private:
         std::uint32_t sequence,
         std::uint64_t senderTickMs);
     void DespawnRemoteReplica() noexcept;
+    void HandleCompanionPlayerState(
+        const Frame& frame,
+        const CompanionPlayerStatePayload& payload);
+    void TickCompanionAvatars(std::uint64_t nowMs);
+    void ClearCompanionAvatars() noexcept;
     void HandleMenuCommand(BridgeCommand command);
     void HandleTeleportToPlayerRequest();
     void HandleTeleportGuestRequest();
@@ -299,6 +304,8 @@ private:
     TelemetryScheduler telemetry_{};
     FrameSequencer sequencer_{};
     SequenceWindow remotePlayerSequences_{};
+    // Players beyond the two-player replica; independent of the replica's own lifecycle.
+    CompanionAvatarTracker companions_{};
     SequenceWindow remoteAnimationSequences_{};
     SequenceWindow remoteAnimationPayloadSequences_{};
     RemoteSnapshotBuffer remoteSnapshots_{};

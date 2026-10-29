@@ -728,6 +728,12 @@ public sealed class SidecarRuntime : IAsyncDisposable
                     seated,
                     peer,
                     token),
+                payload => _networkBridgePump.TryEnqueue(
+                        CreateBridgeEnvelope(
+                            MessageType.CompanionPlayerState,
+                            payload),
+                        () => ReferenceEquals(_network, network))
+                    .Disposition is not NetworkBridgeEnqueueDisposition.Rejected,
                 _logger);
             seated.GuestSlotChanged += (peer, connected, token) =>
                 ReferenceEquals(_network, network)
@@ -4251,6 +4257,7 @@ public sealed class SidecarRuntime : IAsyncDisposable
 
         var controlDescription =
             envelope.Type is MessageType.PlayerState or
+                MessageType.CompanionPlayerState or
                 MessageType.EntityUpdate or
                 MessageType.PlayerMountState or
                 MessageType.PlayerAnimationState or
@@ -4385,6 +4392,7 @@ public sealed class SidecarRuntime : IAsyncDisposable
     {
         var controlDescription =
             envelope.Type is MessageType.PlayerState or
+                MessageType.CompanionPlayerState or
                 MessageType.EntityUpdate or
                 MessageType.PlayerMountState or
                 MessageType.PlayerAnimationState or
@@ -6426,6 +6434,9 @@ public sealed class SidecarRuntime : IAsyncDisposable
             case MessageType.NpcAnimation:
                 _ = NpcAnimationCodec.Decode(envelope.Payload.Span);
                 break;
+            case MessageType.CompanionPlayerState:
+                _ = CompanionPlayerStateCodec.Decode(envelope.Payload.Span);
+                break;
             case MessageType.EntitySpawn:
             case MessageType.EntityUpdate:
                 _ = BinaryPayloadCodec.DecodeWorldEntityState(
@@ -6559,6 +6570,7 @@ public sealed class SidecarRuntime : IAsyncDisposable
         MessageType? messageType) =>
         messageType is
             MessageType.PlayerState or
+            MessageType.CompanionPlayerState or
             MessageType.PlayerAnimationState or
             MessageType.MissionCameraState or
             MessageType.AnimSceneReplicaState or
@@ -6627,6 +6639,11 @@ public sealed class SidecarRuntime : IAsyncDisposable
         if (messageType == MessageType.MotionReplicationConfig)
         {
             return false;
+        }
+        // Only the host relays other players' states; a guest's game never receives them from anyone else.
+        if (messageType == MessageType.CompanionPlayerState)
+        {
+            return localRole == SessionRole.Guest;
         }
         if (messageType == MessageType.AnimSceneDefinition)
         {
@@ -6875,6 +6892,11 @@ public sealed class SidecarRuntime : IAsyncDisposable
             return localRole is SessionRole.Host or SessionRole.Guest;
         }
         if (messageType == MessageType.MotionReplicationConfig)
+        {
+            return false;
+        }
+        // The host sidecar creates these from authenticated seats; no game bridge may originate one.
+        if (messageType == MessageType.CompanionPlayerState)
         {
             return false;
         }

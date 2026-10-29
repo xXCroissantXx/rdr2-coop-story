@@ -119,7 +119,8 @@ internal sealed class NetworkBridgeDeliveryPump
     // Important messages stay in order.
     // Fast updates keep only the newest one so a slow game pipe cannot build an endless queue.
     private readonly Queue<QueuedDelivery> _criticalQueue = new();
-    private readonly Dictionary<MessageType, QueuedDelivery> _coalesced = [];
+    // Keyed by type and, for seat-tagged companion players, by seat, so one player's newest sample never replaces another's.
+    private readonly Dictionary<(MessageType Type, byte Key), QueuedDelivery> _coalesced = [];
     private readonly Dictionary<NetEntityId, QueuedDelivery> _entityUpdates = [];
     // Wake the worker when there is work, and allow only one reset owner to pause delivery at a time.
     private readonly SemaphoreSlim _signal = new(0, 1);
@@ -278,8 +279,9 @@ internal sealed class NetworkBridgeDeliveryPump
             {
                 // For player/camera/animation updates, old data is not useful.
                 // Send the newest view instead of a long backlog.
+                var coalescingKey = (frozen.Type, CoalescingSubKey(frozen));
                 var replaced = _coalesced.TryGetValue(
-                    frozen.Type,
+                    coalescingKey,
                     out var pendingState);
                 var pendingStateValid =
                     replaced && pendingState!.IsStillValid();
@@ -290,7 +292,7 @@ internal sealed class NetworkBridgeDeliveryPump
                         frozen.Sequence,
                         pendingState!.Envelope.Sequence))
                 {
-                    _coalesced[frozen.Type] = pendingStateValid
+                    _coalesced[coalescingKey] = pendingStateValid
                         ? queued with
                         {
                             EnqueueOrder = pendingState!.EnqueueOrder
@@ -497,7 +499,7 @@ internal sealed class NetworkBridgeDeliveryPump
 
             QueuedDelivery? oldest = null;
             var selectedLane = -1;
-            var selectedCoalescedType = default(MessageType);
+            var selectedCoalescedKey = default((MessageType, byte));
             var selectedEntityId = NetEntityId.None;
 
             // Pick the oldest message we kept so replacing old updates does not mess up the important message order.
@@ -513,7 +515,7 @@ internal sealed class NetworkBridgeDeliveryPump
                 {
                     oldest = pair.Value;
                     selectedLane = 1;
-                    selectedCoalescedType = pair.Key;
+                    selectedCoalescedKey = pair.Key;
                 }
             }
             foreach (var pair in _entityUpdates)
@@ -540,7 +542,7 @@ internal sealed class NetworkBridgeDeliveryPump
                     _ = _criticalQueue.Dequeue();
                     break;
                 case 1:
-                    _ = _coalesced.Remove(selectedCoalescedType);
+                    _ = _coalesced.Remove(selectedCoalescedKey);
                     break;
                 case 2:
                     _ = _entityUpdates.Remove(selectedEntityId);
@@ -628,8 +630,15 @@ internal sealed class NetworkBridgeDeliveryPump
     }
 
     // These messages describe a current view, so retaining old versions has no value once a newer version is ready for the same local bridge.
+    private static byte CoalescingSubKey(ProtocolEnvelope envelope) =>
+        envelope.Type == MessageType.CompanionPlayerState &&
+        CompanionPlayerStateCodec.TryReadSeat(envelope.Payload.Span, out var seat)
+            ? seat
+            : (byte)0;
+
     private static bool IsCoalescedType(MessageType type) =>
         type is MessageType.PlayerState or
+            MessageType.CompanionPlayerState or
             MessageType.PlayerAnimationState or
             MessageType.MissionCameraState or
             MessageType.AnimSceneReplicaState or

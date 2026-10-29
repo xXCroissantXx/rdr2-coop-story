@@ -3452,6 +3452,9 @@ ScriptHookSdkFacade::~ScriptHookSdkFacade() {
     MaintainMissionCompanionPresentation({});
     MaintainReplicatedMissionCamera(false, std::nullopt);
     (void)MaintainReplicatedAnimScene(false, std::nullopt);
+    for (std::uint8_t seat = kMinCompanionSeat; seat <= kMaxCompanionSeat; ++seat) {
+        DespawnCompanionAvatar(seat);
+    }
     MaintainMissionSpectator(false);
     MaintainMissionResumeBarrier(false);
     (void)MaintainHostAnimSceneStartBarrier(false);
@@ -12760,6 +12763,160 @@ bool ScriptHookSdkFacade::ApplyRemoteTransformUnsafe(
 }
 
 // Attaches the remote player's stable multiplayer identity/name to its local RDR2 replica after the Sidecar has mapped host/guest roles.
+bool ScriptHookSdkFacade::ApplyCompanionAvatar(
+    const CompanionAvatarCommand& command) noexcept {
+    try {
+#if COOPSTORY_ENABLE_UNVERIFIED_NATIVE_BINDINGS
+        if (command.seat < kMinCompanionSeat ||
+            command.seat > kMaxCompanionSeat ||
+            !IsFinite(command.target) ||
+            !std::isfinite(command.heading)) {
+            return false;
+        }
+        auto& avatar = companionAvatars_[command.seat];
+        auto ped = static_cast<Ped>(avatar.ped);
+        if (ped == 0 || ENTITY::DOES_ENTITY_EXIST(ped) == FALSE) {
+            DespawnCompanionAvatar(command.seat);
+            // Every Story Mode player is Arthur or John, and the local player's model is already streamed in.
+            const auto model = static_cast<Hash>(
+                ENTITY::GET_ENTITY_MODEL(PLAYER::PLAYER_PED_ID()));
+            if (model == 0U ||
+                STREAMING::IS_MODEL_VALID(model) == FALSE ||
+                STREAMING::HAS_MODEL_LOADED(model) == FALSE) {
+                return false;
+            }
+            const auto spawn = GroundSafePedPosition(command.target, model);
+            STREAMING::REQUEST_COLLISION_AT_COORD(spawn.x, spawn.y, spawn.z);
+            ped = PED::CREATE_PED(
+                model,
+                spawn.x,
+                spawn.y,
+                spawn.z,
+                command.heading,
+                FALSE,
+                TRUE,
+                FALSE,
+                FALSE);
+            if (ped == 0 || ENTITY::DOES_ENTITY_EXIST(ped) == FALSE) {
+                return false;
+            }
+            avatar.ped = static_cast<int>(ped);
+            ENTITY::SET_ENTITY_AS_MISSION_ENTITY(ped, TRUE, TRUE);
+            ENTITY::SET_ENTITY_LOAD_COLLISION_FLAG(ped, TRUE);
+            // A companion avatar is a picture of another player, not a target: it never takes or deals damage here.
+            ENTITY::SET_ENTITY_CAN_BE_DAMAGED(ped, FALSE);
+            ENTITY::SET_ENTITY_INVINCIBLE(ped, TRUE);
+            ENTITY::SET_ENTITY_VISIBLE(ped, TRUE);
+            ENTITY::RESET_ENTITY_ALPHA(ped);
+            SetRandomOutfitVariation(ped);
+            PED::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS(ped, TRUE);
+            char friendlyStyle[] = "BLIP_STYLE_FRIENDLY";
+            avatar.blip = static_cast<int>(
+                RADAR::_0x23F74C2FDA6E7C61(
+                    GAMEPLAY::GET_HASH_KEY(friendlyStyle),
+                    ped));
+            if (avatar.blip != 0) {
+                RADAR::SET_BLIP_SCALE(static_cast<Blip>(avatar.blip), 0.85F);
+            }
+            Log(
+                "[COMPANION] spawned avatar for seat " +
+                std::to_string(command.seat) +
+                ", minimap-blip=" + std::to_string(avatar.blip != 0));
+        }
+
+        switch (command.motion) {
+            case CompanionMotion::Place:
+                ENTITY::SET_ENTITY_COORDS_NO_OFFSET(
+                    ped,
+                    command.target.x,
+                    command.target.y,
+                    command.target.z,
+                    FALSE,
+                    FALSE,
+                    FALSE);
+                ENTITY::SET_ENTITY_HEADING(ped, command.heading);
+                AI::TASK_STAND_STILL(ped, 60'000);
+                break;
+            case CompanionMotion::Idle:
+                AI::TASK_ACHIEVE_HEADING(ped, command.heading, 2'000);
+                break;
+            case CompanionMotion::Walk:
+            case CompanionMotion::Run:
+            case CompanionMotion::Sprint:
+                AI::SET_PED_PATH_CAN_USE_CLIMBOVERS(ped, TRUE);
+                AI::SET_PED_PATH_CAN_USE_LADDERS(ped, TRUE);
+                AI::SET_PED_PATH_CAN_DROP_FROM_HEIGHT(ped, FALSE);
+                AI::TASK_FOLLOW_NAV_MESH_TO_COORD(
+                    ped,
+                    command.target.x,
+                    command.target.y,
+                    command.target.z,
+                    CompanionMoveSpeed(command.motion),
+                    kAnimGraphVisualTaskTimeoutMilliseconds,
+                    0.5F,
+                    TRUE,
+                    0.0F);
+                break;
+        }
+        PED::SET_PED_KEEP_TASK(ped, TRUE);
+        return true;
+#else
+        (void)command;
+#endif
+    } catch (...) {
+        // A failed avatar is re-placed on the next sample; it must never crash the bridge.
+    }
+    return false;
+}
+
+void ScriptHookSdkFacade::DespawnCompanionAvatar(
+    const std::uint8_t seat) noexcept {
+    if (seat < kMinCompanionSeat || seat > kMaxCompanionSeat) {
+        return;
+    }
+    auto& avatar = companionAvatars_[seat];
+    try {
+#if COOPSTORY_ENABLE_UNVERIFIED_NATIVE_BINDINGS
+        if (avatar.blip != 0) {
+            auto blip = static_cast<Blip>(avatar.blip);
+            if (RADAR::DOES_BLIP_EXIST(blip) != FALSE) {
+                RADAR::REMOVE_BLIP(&blip);
+            }
+        }
+        auto ped = static_cast<Ped>(avatar.ped);
+        if (ped != 0 && ENTITY::DOES_ENTITY_EXIST(ped) != FALSE) {
+            PED::DELETE_PED(&ped);
+        }
+#endif
+    } catch (...) {
+    }
+    avatar = {};
+}
+
+std::optional<Vec3> ScriptHookSdkFacade::CompanionAvatarPosition(
+    const std::uint8_t seat) noexcept {
+    try {
+#if COOPSTORY_ENABLE_UNVERIFIED_NATIVE_BINDINGS
+        if (seat < kMinCompanionSeat || seat > kMaxCompanionSeat) {
+            return std::nullopt;
+        }
+        const auto ped = static_cast<Ped>(companionAvatars_[seat].ped);
+        if (ped == 0 || ENTITY::DOES_ENTITY_EXIST(ped) == FALSE) {
+            return std::nullopt;
+        }
+        const auto position =
+            ToBridgeVector(ENTITY::GET_ENTITY_COORDS(ped, TRUE, FALSE));
+        if (IsFinite(position)) {
+            return position;
+        }
+#else
+        (void)seat;
+#endif
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
 bool ScriptHookSdkFacade::ApplyRemoteIdentity(
     const PlayerIdentityPayload& identity) noexcept {
     try {

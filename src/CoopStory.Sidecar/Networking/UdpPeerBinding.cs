@@ -134,6 +134,7 @@ internal sealed class UdpPeerBinding
                 MessageType.AnimSceneControl => false,
             MessageType.Heartbeat or
                 MessageType.PlayerState or
+                MessageType.CompanionPlayerState or
                 MessageType.PlayerAnimationState or
                 MessageType.EntityUpdate or
                 MessageType.PlayerMountState or

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "coopstory/bridge/AnimationReplicationCodec.hpp"
+#include "coopstory/bridge/CompanionAvatars.hpp"
 #include "coopstory/bridge/NpcAnimation.hpp"
 #include "coopstory/bridge/Domain.hpp"
 #include "coopstory/bridge/FrameCodec.hpp"
@@ -541,6 +542,21 @@ public:
     }
     [[nodiscard]] virtual bool ApplyRemoteIdentity(
         const PlayerIdentityPayload& identity) noexcept = 0;
+    // Companion avatars for players beyond the two-player replica, one per transport seat.
+    // The defaults keep facades without avatar support inert.
+    [[nodiscard]] virtual bool ApplyCompanionAvatar(
+        const CompanionAvatarCommand& command) noexcept {
+        (void)command;
+        return false;
+    }
+    virtual void DespawnCompanionAvatar(std::uint8_t seat) noexcept {
+        (void)seat;
+    }
+    [[nodiscard]] virtual std::optional<Vec3> CompanionAvatarPosition(
+        std::uint8_t seat) noexcept {
+        (void)seat;
+        return std::nullopt;
+    }
     [[nodiscard]] virtual bool ApplyRemoteAppearance(
         const PlayerAppearanceStatePayload& appearance) noexcept {
         (void)appearance;
